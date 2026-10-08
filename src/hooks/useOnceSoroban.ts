@@ -8,7 +8,7 @@ import {
   xdr,
   Address,
 } from "@stellar/stellar-sdk";
-import { isConnected, requestAccess, signTransaction, getNetwork } from "@stellar/freighter-api";
+import { isConnected, requestAccess, signTransaction } from "@stellar/freighter-api";
 import { CONTRACT_ID, NETWORK_PASSPHRASE, RPC_URL, server } from "@/config/stellar";
 import { toast } from "sonner";
 
@@ -25,7 +25,6 @@ async function waitForFreighter(timeoutMs = 1500): Promise<boolean> {
   return false;
 }
 
-// Sondeo directo por JSON-RPC (evita el fallo de deserialización XDR "Bad union switch: 4")
 async function pollTransactionStatus(hash: string): Promise<"SUCCESS" | "FAILED"> {
   const payload = {
     jsonrpc: "2.0",
@@ -34,7 +33,7 @@ async function pollTransactionStatus(hash: string): Promise<"SUCCESS" | "FAILED"
     params: { hash },
   };
 
-  const maxAttempts = 30; // 30 intentos * 1.5s = 45s de margen
+  const maxAttempts = 30;
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((r) => setTimeout(r, 1500));
     try {
@@ -49,7 +48,7 @@ async function pollTransactionStatus(hash: string): Promise<"SUCCESS" | "FAILED"
       if (status === "SUCCESS") return "SUCCESS";
       if (status === "FAILED") return "FAILED";
     } catch (e) {
-      console.warn("Sondeando estado de transacción...", e);
+      console.warn("Sondeando transacción...", e);
     }
   }
   throw new Error("Tiempo de espera agotado esperando confirmación en Stellar");
@@ -58,10 +57,11 @@ async function pollTransactionStatus(hash: string): Promise<"SUCCESS" | "FAILED"
 export function useOnceSoroban(roomId: number = 0) {
   const [address, setAddress] = useState<string>("");
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [roomData, setRoomData] = useState<{ roundId: number; ticketsSold: number; price: number }>({
+  const [roomData, setRoomData] = useState<{ roundId: number; ticketsSold: number; price: number; isLoaded: boolean }>({
     roundId: 1,
     ticketsSold: 0,
     price: 1,
+    isLoaded: false, // Inicia como no cargado para evitar falsos sorteos al inicio
   });
   const [ticketsOwners, setTicketsOwners] = useState<(string | null)[]>(Array(11).fill(null));
 
@@ -69,7 +69,7 @@ export function useOnceSoroban(roomId: number = 0) {
     try {
       const available = await waitForFreighter();
       if (!available) {
-        toast.error("No se detectó Freighter. Asegúrate de tener la extensión habilitada.");
+        toast.error("No se detectó billetera compatible. Asegúrate de tener la extensión habilitada.");
         return;
       }
 
@@ -78,12 +78,12 @@ export function useOnceSoroban(roomId: number = 0) {
 
       if (userAddress) {
         setAddress(userAddress);
-        toast.success(`Conectado: ${userAddress.slice(0, 4)}...${userAddress.slice(-4)}`);
+        toast.success(`Billetera conectada: ${userAddress.slice(0, 4)}...${userAddress.slice(-4)}`);
       } else {
-        toast.error("Acceso denegado en Freighter");
+        toast.error("Acceso denegado en tu billetera");
       }
     } catch (e: any) {
-      toast.error(e?.message || "Error al conectar Freighter");
+      toast.error(e?.message || "Error al conectar billetera");
     }
   };
 
@@ -119,6 +119,7 @@ export function useOnceSoroban(roomId: number = 0) {
           roundId: Number(raw.round_id),
           ticketsSold: Number(raw.tickets_sold),
           price: Number(raw.ticket_price) / 10_000_000,
+          isLoaded: true,
         });
 
         const mapped = Array(11).fill(null);
@@ -145,7 +146,7 @@ export function useOnceSoroban(roomId: number = 0) {
         setTicketsOwners(mapped);
       }
     } catch (err) {
-      // Ignorar errores de sondeo mientras se inicializa
+      // Ignorar errores de sondeo
     }
   }, [roomId, address]);
 
@@ -155,10 +156,10 @@ export function useOnceSoroban(roomId: number = 0) {
     return () => clearInterval(interval);
   }, [fetchRoomState]);
 
-  const buyTickets = async (ticketNumbers: number[]) => {
+  const buyTickets = async (ticketNumbers: number[]): Promise<{ success: boolean; hash?: string }> => {
     if (!address) {
       await connectWallet();
-      return false;
+      return { success: false };
     }
 
     try {
@@ -197,7 +198,7 @@ export function useOnceSoroban(roomId: number = 0) {
       }
 
       const preparedTx = rpc.assembleTransaction(tx, simulation).build();
-      toast.loading("Confirma la transacción en Freighter...", { id: "stellar-tx" });
+      toast.loading("Confirma la transacción en tu billetera...", { id: "stellar-tx" });
 
       const signed = await signTransaction(preparedTx.toXDR(), {
         networkPassphrase: NETWORK_PASSPHRASE,
@@ -214,21 +215,19 @@ export function useOnceSoroban(roomId: number = 0) {
       if (sent.status === "ERROR") throw new Error("Transacción rechazada por el ledger");
 
       toast.loading("Esperando confirmación del ledger...", { id: "stellar-tx" });
-      
-      // Sondeo limpio por JSON-RPC
       const result = await pollTransactionStatus(sent.hash);
 
       if (result === "SUCCESS") {
         toast.success("¡Boletos servidos con éxito!", { id: "stellar-tx" });
         fetchRoomState();
-        return true;
+        return { success: true, hash: sent.hash.toLowerCase() };
       } else {
         throw new Error("Transacción falló al procesarse en el ledger");
       }
     } catch (err: any) {
       console.error(err);
       toast.error(`Error: ${err.message || String(err)}`, { id: "stellar-tx" });
-      return false;
+      return { success: false };
     } finally {
       setIsProcessing(false);
     }

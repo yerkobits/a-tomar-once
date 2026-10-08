@@ -4,6 +4,7 @@ use soroban_sdk::{
 };
 
 const TICKETS_PER_ROUND: u32 = 11;
+const MAX_TICKETS_PER_PLAYER: u32 = 5; // Medida antibot: nadie puede tener más de 5 boletos en una mesa
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -33,9 +34,9 @@ impl ATomarOnceContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::TokenAddress, &token_address);
 
-        Self::init_room(&env, 0, 10_000_000);    // 1 USDC
-        Self::init_room(&env, 1, 100_000_000);   // 10 USDC
-        Self::init_room(&env, 2, 1_000_000_000); // 100 USDC
+        Self::init_room(&env, 0, 10_000_000);    // 1 XLM
+        Self::init_room(&env, 1, 100_000_000);   // 10 XLM
+        Self::init_room(&env, 2, 1_000_000_000); // 100 XLM
     }
 
     fn init_room(env: &Env, room_id: u32, price: i128) {
@@ -77,6 +78,22 @@ impl ATomarOnceContract {
             panic!("Cantidad de boletos invalida o sala llena");
         }
 
+        // --- MEDIDA ANTIBOT ON-CHAIN ---
+        // Contar cuántos boletos ya posee este comprador en la ronda actual
+        let mut user_tickets = 0u32;
+        for seat in 1..=TICKETS_PER_ROUND {
+            if let Some(owner) = room.participants.get(seat) {
+                if owner == buyer {
+                    user_tickets += 1;
+                }
+            }
+        }
+
+        if (user_tickets + count) > MAX_TICKETS_PER_PLAYER {
+            panic!("Maximo 5 boletos por jugador por mesa para asegurar juego justo");
+        }
+        // ---------------------------------
+
         // Cobro total de boletos
         let total_cost = room.ticket_price * (count as i128);
         client.transfer(&buyer, &env.current_contract_address(), &total_cost);
@@ -101,10 +118,8 @@ impl ATomarOnceContract {
             let dev_fee = room.ticket_price;
             let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
 
-            // 1. Pagar al Ganador (10 boletos = 90.9%)
+            // Pagar al ganador y al dev
             client.transfer(&env.current_contract_address(), &winner, &prize);
-
-            // 2. Pagar inmediatamente la comisión al Dev (1 boleto = 9.1%)
             client.transfer(&env.current_contract_address(), &admin, &dev_fee);
 
             env.events().publish(

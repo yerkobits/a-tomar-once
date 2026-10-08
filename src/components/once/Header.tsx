@@ -52,7 +52,7 @@ export const Header: React.FC<HeaderProps> = ({ address, onConnect, onOpenInfoMo
               className="bg-[#F59E0B] hover:bg-[#D97706] text-black font-semibold rounded-xl gap-2 cursor-pointer shadow-md"
             >
               <Wallet className="w-4 h-4" />
-              <span>Conectar Freighter</span>
+              <span>Conectar billetera</span>
             </Button>
           )}
         </div>

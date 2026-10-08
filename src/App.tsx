@@ -6,30 +6,42 @@ import { useOnceSoroban } from "@/hooks/useOnceSoroban";
 import { DrawModal, type DrawData } from "@/components/once/DrawModal";
 import { HistoryTable, type HistoryItem } from "@/components/once/HistoryTable";
 import { CommunityInfoModal } from "@/components/once/CommunityInfoModal";
+import { TicketLimitModal } from "@/components/once/TicketLimitModal";
 import { Check, Loader2 } from "lucide-react";
-import { Toaster } from "sonner";
+import { Toaster, toast } from "sonner";
 import { CONTRACT_ID, RPC_URL } from "@/config/stellar";
 import { scValToNative, xdr } from "@stellar/stellar-sdk";
 
 const ROOM_MAP: Record<TableId, number> = { campo: 0, tradicional: 1, reina: 2 };
-const HISTORY_KEY = "once_stellar_xlm_history_v3";
+const HISTORY_KEY = "once_stellar_verified_history_v4";
+const MAX_TICKETS_PER_PLAYER = 5;
+
+const getXdrString = (item: any): string => {
+  if (!item) return "";
+  if (typeof item === "string") return item;
+  if (typeof item === "object" && item.xdr) return item.xdr;
+  return "";
+};
 
 export default function App() {
   const [activeTable, setActiveTable] = useState<TableId>("campo");
   const [selected, setSelected] = useState<number[]>([]);
   const [currentDraw, setCurrentDraw] = useState<DrawData | null>(null);
   const [infoModalOpen, setInfoModalOpen] = useState(false);
+  const [limitModalOpen, setLimitModalOpen] = useState(false);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
 
-  // 1. Recuperar historial de v3 o migrar de v1/v2 si existían
   const [history, setHistory] = useState<HistoryItem[]>(() => {
     if (typeof window !== "undefined") {
       try {
-        const v3 = localStorage.getItem(HISTORY_KEY);
-        if (v3) return JSON.parse(v3);
-        const v1 = localStorage.getItem("once_stellar_xlm_history_v1");
-        if (v1) return JSON.parse(v1);
-        const legacy = localStorage.getItem("once_stellar_history_v2");
-        if (legacy) return JSON.parse(legacy);
+        const saved =
+          localStorage.getItem(HISTORY_KEY) ||
+          localStorage.getItem("once_stellar_verified_history_v2") ||
+          localStorage.getItem("once_stellar_verified_history_v1");
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) return parsed.slice(0, 5);
+        }
       } catch (_) {}
     }
     return [];
@@ -41,147 +53,188 @@ export default function App() {
 
   const config = tableById(activeTable);
   const totalCost = selected.length * config.price;
-  const lastRoundRef = useRef<number>(roomData.roundId);
-  const isFirstLoadRef = useRef<boolean>(true);
+  const lastRoundRef = useRef<number>(0);
+  const initialSyncDoneRef = useRef<boolean>(false);
 
-  // Guardar en localStorage
+  const myCurrentTicketsCount = ticketsOwners.filter(
+    (owner) => owner && address && owner.toLowerCase() === address.toLowerCase()
+  ).length;
+
   useEffect(() => {
     if (history.length > 0) {
       try {
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+        localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 5)));
       } catch (_) {}
     }
   }, [history]);
 
-  // Consulta de eventos históricos en Soroban
-  const fetchBlockchainEvents = async (triggerModal = false) => {
-    try {
-      const ledgerRes = await fetch(RPC_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getLatestLedger" }),
-      });
-      const ledgerJson = await ledgerRes.json();
-      const currentSequence = ledgerJson?.result?.sequence;
-      if (!currentSequence) return;
+  // Consulta de eventos en Soroban
+  const fetchBlockchainEvents = async (triggerModal = false, expectedRound?: number, fallbackHash?: string) => {
+    const maxAttempts = triggerModal ? 8 : 1;
 
-      const startLedger = Math.max(1, currentSequence - 200); // Últimos ~15 minutos de bloques
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 1200));
+      }
 
-      const payload = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getEvents",
-        params: {
-          startLedger,
-          filters: [
-            {
-              type: "contract",
-              contractIds: [CONTRACT_ID],
-            },
-          ],
-        },
-      };
+      try {
+        const ledgerRes = await fetch(RPC_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getLatestLedger" }),
+        });
+        const ledgerJson = await ledgerRes.json();
+        const currentSequence = ledgerJson?.result?.sequence;
+        if (!currentSequence) continue;
 
-      const res = await fetch(RPC_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+        let startLedger = Math.max(1, currentSequence - 5000);
 
-      const data = await res.json();
-      const events = data?.result?.events || [];
-      const discoveredItems: HistoryItem[] = [];
+        const payload = {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getEvents",
+          params: {
+            startLedger,
+            filters: [
+              {
+                type: "contract",
+                contractIds: [CONTRACT_ID],
+              },
+            ],
+          },
+        };
 
-      for (let i = events.length - 1; i >= 0; i--) {
-        const ev = events[i];
-        try {
-          const valXdr = xdr.ScVal.fromXDR(ev.value, "base64");
-          const nativeVal: any = scValToNative(valXdr);
+        const res = await fetch(RPC_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
 
-          if (Array.isArray(nativeVal) && nativeVal.length === 3) {
-            const winTicket = Number(nativeVal[0]);
-            const winner = String(nativeVal[1]);
-            const prizeStroops = Number(nativeVal[2]);
-            const prizeXLM = prizeStroops / 10_000_000;
-            const isMine = !!(address && winner.toLowerCase() === address.toLowerCase());
-            const cleanHash = (ev.transactionHash || ev.txHash || "").toLowerCase();
+        const data = await res.json();
+        const events = data?.result?.events || [];
+        const discoveredItems: HistoryItem[] = [];
+        let matchingDraw: DrawData | null = null;
 
-            // Identificar qué sala y qué ronda emitió el evento desde topics
-            let eventRoomId = roomId;
-            let eventRoundId = roomData.roundId > 1 ? roomData.roundId - 1 : 1;
-            try {
-              if (ev.topic && ev.topic.length >= 3) {
-                eventRoomId = Number(scValToNative(xdr.ScVal.fromXDR(ev.topic[1], "base64")));
-                eventRoundId = Number(scValToNative(xdr.ScVal.fromXDR(ev.topic[2], "base64")));
-              }
-            } catch (_) {}
+        for (let i = 0; i < events.length; i++) {
+          const ev = events[i];
+          try {
+            if (!ev.topic || ev.topic.length < 3) continue;
 
-            const tableKey: TableId = eventRoomId === 1 ? "tradicional" : eventRoomId === 2 ? "reina" : "campo";
+            const topic0Base64 = getXdrString(ev.topic[0]);
+            if (!topic0Base64) continue;
+            const topic0 = scValToNative(xdr.ScVal.fromXDR(topic0Base64, "base64"));
+            if (String(topic0).toLowerCase() !== "draw") continue;
 
-            const historyEntry: HistoryItem = {
-              id: eventRoundId,
-              table: tableKey,
-              winningTicket: winTicket,
-              winner: winner,
-              prize: prizeXLM,
-              hash: cleanHash,
-              isMine: isMine,
-              at: Date.now() - (events.length - 1 - i) * 60000,
-            };
+            const topic1Base64 = getXdrString(ev.topic[1]);
+            const topic2Base64 = getXdrString(ev.topic[2]);
+            const eventRoomId = Number(scValToNative(xdr.ScVal.fromXDR(topic1Base64, "base64")));
+            const eventRoundId = Number(scValToNative(xdr.ScVal.fromXDR(topic2Base64, "base64")));
 
-            discoveredItems.push(historyEntry);
+            const valBase64 = getXdrString(ev.value);
+            if (!valBase64) continue;
+            const nativeVal: any = scValToNative(xdr.ScVal.fromXDR(valBase64, "base64"));
 
-            // Si es un sorteo que acaba de ocurrir en vivo, abrir la animación
-            if (triggerModal && i === events.length - 1) {
-              setCurrentDraw({
-                roundId: eventRoundId,
+            if (Array.isArray(nativeVal) && nativeVal.length === 3) {
+              const winTicket = Number(nativeVal[0]);
+              const winner = String(nativeVal[1]);
+              const prizeStroops = Number(nativeVal[2]);
+              const prizeXLM = prizeStroops / 10_000_000;
+              const isMine = !!(address && winner.toLowerCase() === address.toLowerCase());
+              const cleanHash = (ev.txHash || ev.transactionHash || fallbackHash || "").toLowerCase();
+
+              const tableKey: TableId = eventRoomId === 1 ? "tradicional" : eventRoomId === 2 ? "reina" : "campo";
+              const eventTime = ev.ledgerClosedAt ? new Date(ev.ledgerClosedAt).getTime() : Date.now();
+
+              const historyEntry: HistoryItem = {
+                id: eventRoundId,
                 table: tableKey,
                 winningTicket: winTicket,
-                winnerAddress: winner,
-                isWinner: isMine,
+                winner: winner,
                 prize: prizeXLM,
-                txHash: cleanHash,
-              });
-            }
-          }
-        } catch (_) {}
-      }
+                hash: cleanHash,
+                isMine: isMine,
+                at: eventTime,
+              };
 
-      if (discoveredItems.length > 0) {
-        setHistory((prev) => {
-          const combined = [...discoveredItems, ...prev];
-          const unique = combined.filter(
-            (v, idx, arr) => arr.findIndex((t) => t.id === v.id && t.table === v.table) === idx
-          );
-          return unique.sort((a, b) => b.id - a.id).slice(0, 15);
-        });
+              discoveredItems.push(historyEntry);
+
+              if (triggerModal && (!expectedRound || eventRoundId === expectedRound)) {
+                matchingDraw = {
+                  roundId: eventRoundId,
+                  table: tableKey,
+                  winningTicket: winTicket,
+                  winnerAddress: winner,
+                  isWinner: isMine,
+                  prize: prizeXLM,
+                  txHash: cleanHash,
+                };
+              }
+            }
+          } catch (_) {}
+        }
+
+        if (triggerModal && expectedRound && !matchingDraw) {
+          continue;
+        }
+
+        if (discoveredItems.length > 0) {
+          setHistory((prev) => {
+            const combined = [...discoveredItems, ...prev];
+            const unique = combined.filter(
+              (v, idx, arr) => arr.findIndex((t) => t.id === v.id && t.table === v.table) === idx
+            );
+            return unique.sort((a, b) => b.id - a.id).slice(0, 5);
+          });
+        }
+
+        if (matchingDraw) {
+          setCurrentDraw(matchingDraw);
+        }
+
+        break;
+      } catch (e) {
+        console.warn("Sondeando eventos...", e);
+      } finally {
+        setIsLoadingHistory(false);
       }
-    } catch (e) {
-      console.warn("Error leyendo eventos de Soroban:", e);
     }
   };
 
-  // Carga inicial directa de la blockchain al entrar a la DApp
+  // Carga inicial del historial en silencio (sin abrir modales)
   useEffect(() => {
     fetchBlockchainEvents(false);
   }, [CONTRACT_ID, address]);
 
-  // Detección de sorteo en vivo cuando cambia la ronda
+  // Sincronización inteligente de rondas: NO abre modales al cargar la página
   useEffect(() => {
-    if (isFirstLoadRef.current) {
-      isFirstLoadRef.current = false;
+    if (!roomData.isLoaded) return;
+
+    // Primera vez que llegan datos reales de la blockchain: solo sincronizar lastRoundRef
+    if (!initialSyncDoneRef.current) {
+      initialSyncDoneRef.current = true;
       lastRoundRef.current = roomData.roundId;
       return;
     }
 
+    // Solo si la ronda avanza estando ya en vivo en la página:
     if (roomData.roundId > lastRoundRef.current) {
+      const finishedRound = lastRoundRef.current;
       lastRoundRef.current = roomData.roundId;
-      fetchBlockchainEvents(true);
+      fetchBlockchainEvents(true, finishedRound);
     }
-  }, [roomData.roundId]);
+  }, [roomData.isLoaded, roomData.roundId]);
 
   const toggleTicket = (idx: number) => {
     if (ticketsOwners[idx]) return;
+
+    const isCurrentlySelected = selected.includes(idx);
+    if (!isCurrentlySelected) {
+      if (myCurrentTicketsCount + selected.length >= MAX_TICKETS_PER_PLAYER) {
+        setLimitModalOpen(true);
+        return;
+      }
+    }
+
     setSelected((prev) =>
       prev.includes(idx) ? prev.filter((i) => i !== idx) : [...prev, idx]
     );
@@ -189,8 +242,35 @@ export default function App() {
 
   const handleBuy = async () => {
     if (selected.length === 0) return;
-    const ok = await buyTickets(selected.map((i) => i + 1));
-    if (ok) setSelected([]);
+
+    if (myCurrentTicketsCount + selected.length > MAX_TICKETS_PER_PLAYER) {
+      setLimitModalOpen(true);
+      return;
+    }
+
+    const willCompleteRound = roomData.ticketsSold + selected.length === TICKETS_PER_ROUND;
+    const roundBeingCompleted = roomData.roundId;
+
+    try {
+      const res = await buyTickets(selected.map((i) => i + 1));
+
+      if (res.success) {
+        setSelected([]);
+
+        if (willCompleteRound) {
+          toast.loading("¡Mesa completa! Obteniendo ganador del sorteo...", { id: "stellar-tx" });
+          await fetchBlockchainEvents(true, roundBeingCompleted, res.hash);
+          toast.dismiss("stellar-tx");
+        }
+      }
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      if (msg.includes("5 boletos") || msg.includes("UnreachableCodeReached") || msg.includes("InvalidAction")) {
+        setLimitModalOpen(true);
+      } else {
+        toast.error(`Error: ${msg}`, { id: "stellar-tx" });
+      }
+    }
   };
 
   return (
@@ -297,16 +377,20 @@ export default function App() {
               {isProcessing ? (
                 <span className="flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Procesando...</span>
               ) : !isConnected ? (
-                "Conectar Billetera"
+                "Conectar billetera"
               ) : (
-                "Servirse Boletos"
+                "Servir mesa"
               )}
             </Button>
           </div>
         </section>
 
         {/* Tabla de Rondas Históricas */}
-        <HistoryTable history={history} />
+        <HistoryTable
+          history={history}
+          currentAddress={address}
+          isLoading={isLoadingHistory}
+        />
 
         <footer className="text-center text-xs text-[#A8A29E] pt-8">
           Contrato Soroban (Stellar XLM):{" "}
@@ -332,10 +416,16 @@ export default function App() {
         />
       )}
 
-      {/* Modal Informativo */}
+      {/* Modal Informativo General */}
       <CommunityInfoModal
         open={infoModalOpen}
         onClose={() => setInfoModalOpen(false)}
+      />
+
+      {/* Modal Amigable de Límite de Boletos */}
+      <TicketLimitModal
+        open={limitModalOpen}
+        onClose={() => setLimitModalOpen(false)}
       />
 
       <Toaster richColors position="top-left" theme="dark" />
