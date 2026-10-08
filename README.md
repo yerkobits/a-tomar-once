@@ -5,13 +5,10 @@
 [![Rust](https://img.shields.io/badge/Rust-Wasm-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> Una plataforma descentralizada inspirada en la tradición chilena de "tomar once": micro-donaciones, financiamiento colaborativo y apoyo a creadores construida sobre **Soroban Smart Contracts** en la red **Stellar (Testnet)**.
-
----
 
 ## 📋 Descripción
 
-**a Tomar Once** reimagina el concepto de *"Buy Me a Coffee"* adaptado a la cultura chilena y potenciado por la velocidad y bajos costos de la red Stellar. Permite a creadores, proyectos o colectivos recibir apoyos ("onces") de manera no custodial, transparente y verificable mediante smart contracts en WebAssembly (Wasm).
+> **"A Tomar Once"** es una rifa de 11 boletos con la temática de la tradicional merienda de media tarde en Chile. Construida sobre **Soroban Smart Contracts** en la red **Stellar**.
 
 ---
 
