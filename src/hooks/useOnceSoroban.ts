@@ -8,7 +8,7 @@ import {
   xdr,
   Address,
 } from "@stellar/stellar-sdk";
-import { isConnected, requestAccess, signTransaction } from "@stellar/freighter-api";
+import { isConnected, requestAccess, signTransaction, getPublicKey } from "@stellar/freighter-api";
 import { CONTRACT_ID, NETWORK_PASSPHRASE, RPC_URL, server } from "@/config/stellar";
 import { toast } from "sonner";
 
@@ -56,6 +56,31 @@ async function pollTransactionStatus(hash: string): Promise<"SUCCESS" | "FAILED"
 
 export function useOnceSoroban(roomId: number = 0) {
   const [address, setAddress] = useState<string>("");
+
+  // Auto-sincronización fluida con getPublicKey
+  useEffect(() => {
+    if (!address) return;
+    let isMounted = true;
+
+    const checkAccountChange = async () => {
+      try {
+        const currentAddress = await getPublicKey();
+        if (isMounted && currentAddress && currentAddress !== address) {
+          setAddress(currentAddress);
+          toast.info(`Wallet actualizada: ${currentAddress.slice(0, 4)}...${currentAddress.slice(-4)}`);
+        }
+      } catch (e) {
+        // Ignorar si la extensión no responde en ese ciclo
+      }
+    };
+
+    const interval = setInterval(checkAccountChange, 1500);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, [address]);
+
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [roomData, setRoomData] = useState<{ roundId: number; ticketsSold: number; price: number; isLoaded: boolean }>({
     roundId: 1,
